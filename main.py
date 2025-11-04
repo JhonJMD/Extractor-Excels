@@ -6,8 +6,21 @@ import pandas as pd
 import io
 import re
 import unicodedata
+import os
+import json
+import logging
+import psycopg2
+import requests
 
-app = FastAPI(title="TIV Ingest API", version="1.0.0")
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="TIV Ingest API", version="2.0.0")
+
+# Variables de entorno para PostgreSQL y n8n
+POSTGRES_CONN_STR = os.environ.get("POSTGRES_CONNECTION_STRING")
+N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL")
 
 # ----------------------------
 # Utilidades
@@ -114,6 +127,43 @@ class ColumnMap(BaseModel):
 class PricingSheets(BaseModel):
     Valores: List[Dict[str, Any]]
     Ubicaciones: List[Dict[str, Any]]
+
+class SiniestroItem(BaseModel):
+    """Modelo para un registro de siniestro."""
+    num_poliza: str
+    fecha_siniestro: Optional[str] = None
+    liquidado: Optional[float] = None
+    reserva_actual: Optional[float] = None
+    incurrido: Optional[float] = None
+    producto: Optional[str] = None
+    ramo_tecnico: Optional[str] = None
+    anio_siniestro: Optional[int] = None
+
+class SiniestrosResponse(BaseModel):
+    """Respuesta con datos de siniestralidad consolidados."""
+    items: List[SiniestroItem]
+    total_incurrido: float
+    total_liquidado: float
+    total_reserva: float
+    resumen_por_anio: Dict[int, Dict[str, float]]
+
+class AnalisisTecnicoRequest(BaseModel):
+    """Request para análisis técnico completo."""
+    tipo_negocio: Optional[str] = Field(None, description="'nuevo' o 'renovacion'")
+    slip_data: Optional[Dict[str, Any]] = Field(default_factory=dict)
+
+class AnalisisTecnicoResponse(BaseModel):
+    """Respuesta del análisis técnico."""
+    analysis_id: Optional[int] = None
+    tipo_negocio: str
+    tiv_total: float
+    burning_cost: float
+    items_tiv: List[TIVItem]
+    siniestros_procesados: int
+    resumen_siniestros: Optional[Dict[str, Any]] = None
+    slip_info: Dict[str, Any]
+    n8n_triggered: bool
+    mensaje: str
 
 # Diccionario de alias para formato estándar
 ALIAS_MAP = {
@@ -403,6 +453,355 @@ def summarize(items: List[TIVItem]) -> Dict[str, Any]:
     }
 
 # ----------------------------
+# Funciones para Base de Datos y n8n
+# ----------------------------
+
+def get_db_connection():
+    """Establece conexión con PostgreSQL."""
+    if not POSTGRES_CONN_STR:
+        logger.error("POSTGRES_CONNECTION_STRING no está configurada.")
+        return None
+    try:
+        conn = psycopg2.connect(POSTGRES_CONN_STR)
+        logger.info("Conexión a PostgreSQL establecida.")
+        return conn
+    except Exception as e:
+        logger.error(f"Error conectando a PostgreSQL: {e}")
+        return None
+
+def insert_analysis_results(conn, results_dict):
+    """Inserta resultados del análisis técnico en la BD."""
+    if not conn:
+        logger.error("No hay conexión a BD.")
+        return None
+    
+    try:
+        cursor = conn.cursor()
+        sql = """
+        INSERT INTO analisis_tecnico_inicial 
+        (tipo_negocio, tiv_total, burning_cost, otros_datos_json, created_at)
+        VALUES (%s, %s, %s, %s, NOW())
+        RETURNING id;
+        """
+        tipo_negocio = results_dict.get('tipo_negocio', 'desconocido')
+        tiv = results_dict.get('tiv_total', 0.0)
+        bc = results_dict.get('burning_cost', 0.0)
+        
+        otros_datos = {k: v for k, v in results_dict.items() 
+                      if k not in ['tipo_negocio', 'tiv_total', 'burning_cost']}
+        
+        cursor.execute(sql, (tipo_negocio, tiv, bc, json.dumps(otros_datos)))
+        inserted_id = cursor.fetchone()[0]
+        conn.commit()
+        cursor.close()
+        logger.info(f"Resultados insertados en BD con ID: {inserted_id}")
+        return inserted_id
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error insertando en BD: {e}")
+        if cursor:
+            cursor.close()
+        return None
+
+def trigger_n8n_webhook(analysis_id):
+    """Llama al webhook de n8n."""
+    if not N8N_WEBHOOK_URL:
+        logger.warning("N8N_WEBHOOK_URL no configurada.")
+        return False
+    if analysis_id is None:
+        logger.error("analysis_id es None.")
+        return False
+    
+    try:
+        payload = {"analysis_id": analysis_id}
+        headers = {'Content-Type': 'application/json'}
+        response = requests.post(N8N_WEBHOOK_URL, json=payload, 
+                               headers=headers, timeout=15)
+        response.raise_for_status()
+        logger.info(f"Webhook n8n llamado para analysis_id: {analysis_id}")
+        return True
+    except requests.exceptions.Timeout:
+        logger.error("Timeout llamando a n8n webhook.")
+        return False
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error llamando a n8n webhook: {e}")
+        return False
+
+# ----------------------------
+# Funciones para Siniestralidad
+# ----------------------------
+
+def process_siniestralidad_file(file_content: bytes, filename: str) -> pd.DataFrame:
+    """Procesa un archivo de siniestralidad y retorna DataFrame."""
+    try:
+        # Detectar encoding
+        try:
+            content_str = file_content.decode('utf-8')
+        except UnicodeDecodeError:
+            content_str = file_content.decode('latin-1', errors='ignore')
+            logger.warning(f"Usando Latin-1 para {filename}")
+        
+        # Leer CSV
+        df = pd.read_csv(io.StringIO(content_str), sep=None, engine='python',
+                        on_bad_lines='warn')
+        
+        # Mapeo de columnas comunes
+        column_mapping = {
+            'num. poliza': 'Num. Poliza',
+            'número póliza': 'Num. Poliza',
+            'poliza': 'Num. Poliza',
+            'fec. sini': 'Fec. Sini',
+            'fecha siniestro': 'Fec. Sini',
+            'liquidado': 'Liquidado',
+            'rva. actual': 'Rva. Actual',
+            'reserva': 'Rva. Actual',
+            'nom. procucto': 'Nom. Procucto',
+            'producto': 'Nom. Procucto',
+            'ramo técnico': 'Ramo Técnico',
+            'ramo tecnico': 'Ramo Técnico'
+        }
+        
+        # Normalizar nombres de columnas
+        df.columns = df.columns.str.strip().str.lower()
+        df.rename(columns=column_mapping, inplace=True)
+        
+        # Verificar columnas requeridas
+        required = ['Num. Poliza', 'Liquidado', 'Rva. Actual']
+        missing = [col for col in required if col not in df.columns]
+        
+        if missing:
+            logger.warning(f"Columnas faltantes en {filename}: {missing}")
+            return pd.DataFrame()
+        
+        # Convertir a numérico
+        df['Liquidado'] = pd.to_numeric(df['Liquidado'], errors='coerce').fillna(0)
+        df['Rva. Actual'] = pd.to_numeric(df['Rva. Actual'], errors='coerce').fillna(0)
+        
+        # Calcular Incurrido
+        df['Incurrido'] = df['Liquidado'] + df['Rva. Actual']
+        
+        # Extraer año del siniestro
+        if 'Fec. Sini' in df.columns:
+            df['Fec. Sini'] = pd.to_datetime(df['Fec. Sini'], errors='coerce')
+            df['año_siniestro'] = df['Fec. Sini'].dt.year
+        
+        # Filtrar por TRDM (Todo Riesgo Daño Material)
+        if 'Ramo Técnico' in df.columns:
+            df = df[df['Ramo Técnico'].str.contains('TRDM|Todo Riesgo|Daño Material', 
+                                                    case=False, na=False)]
+        
+        logger.info(f"Procesado {filename}: {len(df)} registros")
+        return df
+        
+    except Exception as e:
+        logger.error(f"Error procesando {filename}: {e}")
+        return pd.DataFrame()
+
+def consolidar_siniestralidad(files: List[tuple]) -> pd.DataFrame:
+    """
+    Consolida múltiples archivos de siniestralidad.
+    files: lista de tuplas (filename, file_content_bytes)
+    """
+    lista_dfs = []
+    
+    for filename, content in files:
+        if 'siniestralidad' in filename.lower() or 'siniestro' in filename.lower():
+            df = process_siniestralidad_file(content, filename)
+            if not df.empty:
+                lista_dfs.append(df)
+    
+    if not lista_dfs:
+        logger.warning("No se encontraron datos de siniestralidad válidos.")
+        return pd.DataFrame()
+    
+    df_consolidado = pd.concat(lista_dfs, ignore_index=True)
+    logger.info(f"Siniestralidad consolidada: {len(df_consolidado)} registros")
+    return df_consolidado
+
+
+def procesar_tiv_bytes(file_content: bytes, filename: str):
+    """
+    Procesa un archivo TIV desde bytes y retorna (df_tiv, tiv_total)
+    Soporta CSV o Excel. Implementa la lógica de extracción robusta similar
+    a la versión de Azure Function: intenta extraer una celda objetivo y
+    hace fallback sumando columnas numéricas.
+    """
+    tiv_total = 0.0
+    df_tiv = pd.DataFrame()
+
+    name = filename.lower() if filename else ""
+    try:
+        if name.endswith('.csv'):
+            # Intentar leer como CSV con detección de encoding
+            try:
+                content_str = file_content.decode('utf-8')
+                detected_encoding = 'utf-8'
+            except UnicodeDecodeError:
+                content_str = file_content.decode('latin-1', errors='ignore')
+                detected_encoding = 'latin-1'
+            lines = content_str.splitlines()
+
+            # Buscar encabezado por 'Bienes Asegurables'
+            header_row_index = -1
+            for i, line in enumerate(lines):
+                if 'Bienes Asegurables' in line:
+                    header_row_index = i
+                    break
+            if header_row_index == -1:
+                header_row_index = 7
+
+            try:
+                df_tiv = pd.read_csv(io.StringIO('\n'.join(lines[header_row_index:])), sep=None, engine='python', encoding=detected_encoding, on_bad_lines='skip')
+            except Exception:
+                df_tiv = pd.read_csv(io.StringIO('\n'.join(lines[header_row_index:])), engine='python', on_bad_lines='skip')
+
+        else:
+            # Intentar leer como Excel
+            try:
+                # Reutilizar _read_table para leer con header=None
+                df_raw = _read_table(file_content, filename)
+                # intentar encontrar la hoja/encabezado mediante heurística
+                # convertir a DataFrame con header=0 desde fila 6/7 si procede
+                if len(df_raw) > 8:
+                    df_tiv = pd.read_excel(io.BytesIO(file_content), engine='openpyxl', header=6)
+                else:
+                    df_tiv = pd.read_excel(io.BytesIO(file_content), engine='openpyxl')
+            except Exception:
+                # Fallback: intentar leer primera hoja con pandas
+                df_tiv = pd.read_excel(io.BytesIO(file_content), engine='openpyxl')
+
+        # Normalizar columnas
+        try:
+            df_tiv.columns = df_tiv.columns.astype(str).str.strip().str.replace('\r','').str.replace('\n','')
+        except Exception:
+            pass
+
+        # Intentar extraer valor objetivo (etiqueta conocida)
+        target_row_label = "Valor Total Asegurado + I.V."
+        label_column_index = 1
+        value_column_index = 22
+
+        found_row = None
+        try:
+            if df_tiv.shape[1] > label_column_index:
+                found = df_tiv[df_tiv.iloc[:, label_column_index].astype(str).str.strip() == target_row_label]
+                if not found.empty:
+                    found_row = found.iloc[0]
+        except Exception:
+            found_row = None
+
+        if found_row is not None:
+            try:
+                if value_column_index < df_tiv.shape[1]:
+                    tiv_total_str = found_row.iloc[value_column_index]
+                    cleaned_str = str(tiv_total_str).replace('$','').strip()
+                    if ',' in cleaned_str and '.' in cleaned_str:
+                        if cleaned_str.rfind('.') > cleaned_str.rfind(','):
+                            cleaned_str = cleaned_str.replace(',','')
+                        else:
+                            cleaned_str = cleaned_str.replace('.','').replace(',','.')
+                    else:
+                        cleaned_str = cleaned_str.replace(',','.')
+                    tiv_total = pd.to_numeric(cleaned_str, errors='coerce')
+                    if pd.isna(tiv_total):
+                        tiv_total = 0.0
+                else:
+                    tiv_total = 0.0
+            except Exception:
+                tiv_total = 0.0
+
+        # Fallback: sumar columnas numéricas
+        if tiv_total == 0.0:
+            numeric_cols = []
+            for col in df_tiv.columns[-15:]:
+                try:
+                    col_series = df_tiv[col].astype(str).str.replace('$','').str.strip()
+                    # limpieza básica
+                    col_series = col_series.str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
+                    numeric = pd.to_numeric(col_series, errors='coerce')
+                    if numeric.notna().sum() > 0:
+                        df_tiv[col] = numeric.fillna(0)
+                        numeric_cols.append(col)
+                except Exception:
+                    continue
+
+            if numeric_cols:
+                # intentar ignorar subtotales buscando labels
+                end_row = len(df_tiv)
+                try:
+                    label_col = df_tiv.columns[label_column_index]
+                    for i, val in enumerate(df_tiv[label_col].astype(str)):
+                        if any(k in val for k in ['Subtotales','Índice variable','Valor Total Asegurado']):
+                            end_row = i
+                            break
+                except Exception:
+                    end_row = len(df_tiv)
+
+                try:
+                    tiv_total = float(df_tiv.iloc[:end_row][numeric_cols].sum().sum())
+                except Exception:
+                    tiv_total = 0.0
+
+    except Exception as e:
+        logger.exception(f"Error procesando TIV bytes: {e}")
+
+    if pd.isna(tiv_total):
+        tiv_total = 0.0
+
+    return df_tiv, float(tiv_total)
+
+def calcular_burning_cost(df_siniestros: pd.DataFrame, tiv_total: float) -> float:
+    """Calcula el Burning Cost (Incurrido / TIV)."""
+    if tiv_total is None or pd.isna(tiv_total) or tiv_total == 0:
+        logger.warning(f"TIV Total inválido: {tiv_total}")
+        return 0.0
+    
+    if df_siniestros is None or df_siniestros.empty or 'Incurrido' not in df_siniestros.columns:
+        logger.info("No hay siniestros para calcular Burning Cost.")
+        return 0.0
+    
+    total_incurrido = df_siniestros['Incurrido'].sum()
+    if pd.isna(total_incurrido):
+        return 0.0
+    
+    burning_cost = total_incurrido / tiv_total if tiv_total != 0 else 0
+    logger.info(f"Burning Cost: {burning_cost:.4%} (Incurrido: {total_incurrido}, TIV: {tiv_total})")
+    return burning_cost
+
+def generar_resumen_siniestros(df: pd.DataFrame) -> Dict[str, Any]:
+    """Genera resumen estadístico de siniestros."""
+    if df.empty:
+        return {}
+    
+    resumen = {
+        "total_siniestros": len(df),
+        "total_incurrido": float(df['Incurrido'].sum()),
+        "total_liquidado": float(df['Liquidado'].sum()),
+        "total_reserva": float(df['Rva. Actual'].sum()),
+    }
+    
+    # Resumen por año
+    if 'año_siniestro' in df.columns:
+        por_anio = df.groupby('año_siniestro').agg({
+            'Incurrido': 'sum',
+            'Liquidado': 'sum',
+            'Rva. Actual': 'sum',
+            'Num. Poliza': 'count'
+        }).to_dict('index')
+        
+        resumen['por_anio'] = {
+            int(year): {
+                'incurrido': float(data['Incurrido']),
+                'liquidado': float(data['Liquidado']),
+                'reserva': float(data['Rva. Actual']),
+                'cantidad': int(data['Num. Poliza'])
+            }
+            for year, data in por_anio.items() if not pd.isna(year)
+        }
+    
+    return resumen
+
+# ----------------------------
 # Endpoints
 # ----------------------------
 
@@ -503,6 +902,199 @@ async def tiv_to_pricing(
         Valores=valores, 
         Ubicaciones=df_u.to_dict(orient="records")
     )
+
+@app.post("/siniestralidad/parse")
+async def parse_siniestralidad(
+    files: List[UploadFile] = File(..., description="Archivos CSV de siniestralidad")
+):
+    """
+    Procesa uno o más archivos de siniestralidad y los consolida.
+    Filtra automáticamente por TRDM (Todo Riesgo Daño Material).
+    """
+    files_data = []
+    
+    for file in files:
+        content = await file.read()
+        files_data.append((file.filename, content))
+    
+    # Consolidar
+    df_consolidado = consolidar_siniestralidad(files_data)
+    
+    if df_consolidado.empty:
+        raise HTTPException(
+            status_code=422,
+            detail="No se pudieron procesar los archivos de siniestralidad."
+        )
+    
+    # Generar resumen
+    resumen = generar_resumen_siniestros(df_consolidado)
+    
+    # Convertir a items
+    items = []
+    for _, row in df_consolidado.iterrows():
+        items.append(SiniestroItem(
+            num_poliza=str(row.get('Num. Poliza', '')),
+            fecha_siniestro=str(row.get('Fec. Sini', '')) if pd.notna(row.get('Fec. Sini')) else None,
+            liquidado=float(row.get('Liquidado', 0)),
+            reserva_actual=float(row.get('Rva. Actual', 0)),
+            incurrido=float(row.get('Incurrido', 0)),
+            producto=str(row.get('Nom. Procucto', '')) if pd.notna(row.get('Nom. Procucto')) else None,
+            ramo_tecnico=str(row.get('Ramo Técnico', '')) if pd.notna(row.get('Ramo Técnico')) else None,
+            anio_siniestro=int(row.get('año_siniestro')) if pd.notna(row.get('año_siniestro')) else None
+        ))
+    
+    return SiniestrosResponse(
+        items=items,
+        total_incurrido=resumen.get('total_incurrido', 0),
+        total_liquidado=resumen.get('total_liquidado', 0),
+        total_reserva=resumen.get('total_reserva', 0),
+        resumen_por_anio=resumen.get('por_anio', {})
+    )
+
+@app.post("/analisis-tecnico", response_model=AnalisisTecnicoResponse)
+async def analisis_tecnico_completo(
+    tiv_file: UploadFile = File(..., description="Archivo TIV"),
+    siniestros_files: List[UploadFile] = File(default=[], description="Archivos de siniestralidad (opcional)"),
+    request_data: str = Body(default='{}', description="Datos adicionales en JSON")
+):
+    """
+    Realiza un análisis técnico completo:
+    1. Procesa el TIV
+    2. Procesa siniestralidad (si se proporciona)
+    3. Calcula Burning Cost
+    4. Determina si es negocio nuevo o renovación
+    5. Guarda en BD (si está configurada)
+    6. Dispara webhook n8n (si está configurado)
+    """
+    try:
+        # Parsear datos adicionales
+        try:
+            extra_data = json.loads(request_data)
+        except:
+            extra_data = {}
+        
+        # 1. Procesar TIV
+        logger.info("Procesando archivo TIV...")
+        # Leer bytes del archivo para permitir varios pasos de parseo
+        tiv_bytes = await tiv_file.read()
+        # Intentar parsear TIV en formato transpuesto o estándar
+        try:
+            raw_df = _read_table(tiv_bytes, tiv_file.filename)
+        except Exception as e:
+            logger.warning(f"No se pudo leer TIV como tabla: {e}. Intentando procesamiento por bytes.")
+            raw_df = None
+
+        records = []
+        if raw_df is not None:
+            records = parse_transposed_tiv(raw_df)
+            if not records:
+                records = parse_standard_tiv(raw_df, {})
+
+        # Si no se pudieron obtener records con los parsers, fallback a parse_tiv endpoint
+        if not records:
+            # reconstruir UploadFile-like leyendo desde bytes: llamar al endpoint parse_tiv
+            # Crear un objeto temporal UploadFile no trivial; en su lugar, llamar a procesar_tiv_bytes
+            df_tiv_fallback, tiv_total = procesar_tiv_bytes(tiv_bytes, tiv_file.filename)
+        else:
+            # Calcular TIV total sumando los totales detectados
+            tiv_total = 0
+            resumen_tot = summarize(records).get('totales', {})
+            for key in ['valor_edificio', 'valor_maquinaria_contenidos', 'valor_stock', 'valor_mejoras']:
+                tiv_total += resumen_tot.get(key, 0) or 0
+            # Además intentar extraer TIV objetivo con procesar_tiv_bytes y usar si mayor a 0
+            _, tiv_total_bytes = procesar_tiv_bytes(tiv_bytes, tiv_file.filename)
+            if tiv_total_bytes and tiv_total_bytes > 0:
+                tiv_total = tiv_total_bytes
+        
+        # Construir un objeto similar a parse_tiv response para reuse
+        tiv_response = type('Tmp', (), {})()
+        tiv_response.items = records
+        tiv_response.resumen = {'totales': summarize(records).get('totales', {})} if records else {'totales': {}}
+        
+        # 2. Procesar siniestralidad
+        df_siniestros = pd.DataFrame()
+        resumen_siniestros = None
+        
+        if siniestros_files and len(siniestros_files) > 0:
+            logger.info(f"Procesando {len(siniestros_files)} archivos de siniestralidad...")
+            files_data = []
+            for file in siniestros_files:
+                content = await file.read()
+                files_data.append((file.filename, content))
+            
+            df_siniestros = consolidar_siniestralidad(files_data)
+            if not df_siniestros.empty:
+                resumen_siniestros = generar_resumen_siniestros(df_siniestros)
+        
+        # 3. Determinar tipo de negocio
+        tipo_negocio_explicit = extra_data.get('tipo_negocio', '').lower()
+        tipo_negocio = tipo_negocio_explicit if tipo_negocio_explicit in ['nuevo', 'renovacion'] else (
+            'renovacion' if not df_siniestros.empty else 'nuevo'
+        )
+        
+        logger.info(f"Tipo de negocio detectado: {tipo_negocio}")
+        
+        # 4. Calcular Burning Cost
+        burning_cost = calcular_burning_cost(df_siniestros, tiv_total)
+        
+        # 5. Preparar resultados
+        results = {
+            'tipo_negocio': tipo_negocio,
+            'tiv_total': tiv_total,
+            'burning_cost': burning_cost,
+            'num_ubicaciones': len(tiv_response.items),
+            'siniestros_procesados': len(df_siniestros),
+            'slip_info': extra_data.get('slip_data', {}),
+            'resumen_siniestros': resumen_siniestros
+        }
+        
+        # 6. Guardar en BD (si está configurado)
+        analysis_id = None
+        if POSTGRES_CONN_STR:
+            conn = get_db_connection()
+            if conn:
+                analysis_id = insert_analysis_results(conn, results)
+                conn.close()
+            else:
+                logger.warning("No se pudo conectar a BD, continuando sin guardar.")
+        else:
+            logger.info("BD no configurada, saltando guardado.")
+        
+        # 7. Disparar n8n (si está configurado y se guardó en BD)
+        n8n_triggered = False
+        if analysis_id and N8N_WEBHOOK_URL:
+            n8n_triggered = trigger_n8n_webhook(analysis_id)
+        
+        # 8. Preparar respuesta
+        mensaje = f"Análisis técnico '{tipo_negocio}' completado."
+        if analysis_id:
+            mensaje += f" ID: {analysis_id}."
+        if n8n_triggered:
+            mensaje += " Flujo n8n iniciado."
+        elif N8N_WEBHOOK_URL and analysis_id:
+            mensaje += " Advertencia: fallo al iniciar flujo n8n."
+        
+        return AnalisisTecnicoResponse(
+            analysis_id=analysis_id,
+            tipo_negocio=tipo_negocio,
+            tiv_total=tiv_total,
+            burning_cost=burning_cost,
+            items_tiv=tiv_response.items,
+            siniestros_procesados=len(df_siniestros),
+            resumen_siniestros=resumen_siniestros,
+            slip_info=extra_data.get('slip_data', {}),
+            n8n_triggered=n8n_triggered,
+            mensaje=mensaje
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Error en análisis técnico: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error interno durante el análisis técnico: {str(e)}"
+        )
 
 if __name__ == "__main__":
     import uvicorn
